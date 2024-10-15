@@ -409,6 +409,7 @@ impl ContentStore {
         loop {
             poll.poll(&mut events, None)?;
             for event in events.iter() {
+                trace!("Received event: {:?}", event);
                 match event.token() {
                     SERVER_TOKEN => {
                         accept_new_connections(&mut listener, &mut connections, &poll)?;
@@ -417,12 +418,15 @@ impl ContentStore {
                         let conn = &mut connections[id];
                         if event.is_write_closed() || event.is_read_closed() {
                             conn.close(&poll);
-                        } else if event.is_writable() {
+                            continue;
+                        }
+                        if event.is_writable() {
                             if let Err(err) = conn.try_write() {
                                 warn!("Error writing to connection: {:?}", err);
                                 conn.close(&poll);
                             }
-                        } else if event.is_readable() && conn.pending_write.is_none() {
+                        }
+                        if event.is_readable() && conn.pending_write.is_none() {
                             if let Err(err) = conn.try_read() {
                                 warn!("Error reading from connection: {:?}", err);
                                 conn.close(&poll);
@@ -617,12 +621,12 @@ fn parse_args() -> (String, String, LogLevel) {
     // Skip the executable name
     args.next();
     let mut content_root = String::new();
-    let mut bind_address = "127.0.0.1:8080".to_string();
+    let mut bind_address = "[::]:8080".to_string();
     let mut log_level = LogLevel::Info;
 
     fn print_usage_and_exit(code: i32) {
         println!(
-            "Usage: {} [OPTIONS] <content-root>",
+            "Usage: {} [OPTIONS] <content-root> (default: .)",
             env::args().next().unwrap()
         );
         println!("Options:");
@@ -673,8 +677,7 @@ fn parse_args() -> (String, String, LogLevel) {
     }
 
     if content_root.is_empty() {
-        eprintln!("Error: <content-root> is required");
-        print_usage_and_exit(1);
+        content_root = ".".to_string();
     }
     (content_root, bind_address, log_level)
 }
