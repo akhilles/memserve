@@ -2,6 +2,10 @@
 name = "memserve"
 version = "0.1.0"
 edition = "2021"
+description = "Web server that serves static web content from memory."
+repository = "https://git.sr.ht/~akhil/crc-catalog"
+readme = "README.md"
+license = "MIT OR Apache-2.0"
 
 [[bin]]
 name = "memserve"
