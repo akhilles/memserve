@@ -3,8 +3,7 @@ use std::io::Write as _;
 use std::io::{self, IoSlice, Read};
 use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::SystemTime;
-use std::{array::from_fn, collections::HashMap, fmt, path::Path};
+use std::{array::from_fn, collections::HashMap, env, fmt, path::Path, process, time};
 
 use flate2::write::GzEncoder;
 use mio::net::{TcpListener, TcpStream};
@@ -26,7 +25,7 @@ struct ContentStore {
 struct Connection {
     token: Token,
     stream: Option<TcpStream>,
-    last_request: SystemTime,
+    last_request: time::Instant,
     buffer: Box<[u8]>,
     buffer_len: usize,
     pending_write: Option<PendingWrite>,
@@ -63,7 +62,6 @@ enum LogLevel {
 
 static GLOBAL_LOG_LEVEL: AtomicUsize = AtomicUsize::new(LogLevel::Debug as usize);
 
-#[allow(dead_code)]
 fn set_log_level(level: LogLevel) {
     GLOBAL_LOG_LEVEL.store(level as usize, Ordering::Relaxed);
 }
@@ -107,7 +105,7 @@ impl Connection {
         Self {
             token,
             stream: None,
-            last_request: std::time::UNIX_EPOCH,
+            last_request: time::Instant::now(),
             buffer: Box::new([0; MAX_REQUEST_SIZE]),
             buffer_len: 0,
             pending_write: None,
@@ -119,10 +117,7 @@ impl Connection {
             Some(stream) => stream,
             None => return true,
         };
-        let stale = self
-            .last_request
-            .elapsed()
-            .map_or(true, |elapsed| elapsed.as_secs() >= 60);
+        let stale = self.last_request.elapsed() > time::Duration::from_secs(10);
         if stale {
             let addr = stream.peer_addr().unwrap();
             info!("Connection from addr={} is stale", addr);
@@ -221,7 +216,7 @@ impl Connection {
         let request = Request::new(path, accept_gzip, if_none_match)?;
         self.buffer.copy_within(len.., 0);
         self.buffer_len -= len;
-        self.last_request = SystemTime::now();
+        self.last_request = time::Instant::now();
         Ok(request)
     }
 
@@ -235,7 +230,7 @@ impl Connection {
             self.close(poll);
         }
         self.stream = Some(stream);
-        self.last_request = SystemTime::now();
+        self.last_request = time::Instant::now();
         poll.registry()
             .register(
                 self.stream.as_mut().unwrap(),
@@ -603,8 +598,78 @@ fn gzippable(content_type: &str) -> bool {
     }
 }
 
+fn parse_args() -> (String, String, LogLevel) {
+    let mut args = env::args();
+    // Skip the executable name
+    args.next();
+    let mut content_root = String::new();
+    let mut bind_address = "127.0.0.1:8080".to_string();
+    let mut log_level = LogLevel::Info;
+
+    fn print_usage_and_exit(code: i32) {
+        println!(
+            "Usage: {} [OPTIONS] <content-root>",
+            env::args().next().unwrap()
+        );
+        println!("Options:");
+        println!(
+            "  --bind-address <address>  Specify the address to bind to (default: 127.0.0.1:8080)"
+        );
+        println!("  --log-level <level>       Set the log level (trace, debug, info, warn, error)");
+        println!("  --help                    Print this help message and exit");
+        process::exit(code);
+    }
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--help" => print_usage_and_exit(0),
+            "--bind-address" => {
+                bind_address = args.next().unwrap_or_else(|| {
+                    eprintln!("Error: --bind-address requires an argument");
+                    process::exit(1);
+                });
+            }
+            "--log-level" => {
+                if let Some(level) = args.next() {
+                    log_level = match level.to_lowercase().as_str() {
+                        "trace" => LogLevel::Trace,
+                        "debug" => LogLevel::Debug,
+                        "info" => LogLevel::Info,
+                        "warn" => LogLevel::Warn,
+                        "error" => LogLevel::Error,
+                        _ => {
+                            eprintln!("Error: Invalid log level. Valid levels are: trace, debug, info, warn, error");
+                            process::exit(1);
+                        }
+                    };
+                } else {
+                    eprintln!("Error: --log-level requires an argument");
+                    process::exit(1);
+                }
+            }
+            _ => {
+                if content_root.is_empty() {
+                    content_root = arg;
+                } else {
+                    eprintln!("Error: Unexpected argument: {}", arg);
+                    print_usage_and_exit(1);
+                }
+            }
+        }
+    }
+
+    if content_root.is_empty() {
+        eprintln!("Error: <content-root> is required");
+        print_usage_and_exit(1);
+    }
+    (content_root, bind_address, log_level)
+}
+
 fn main() {
-    let cs = ContentStore::new("../elo/paracosm/docs/public/public").unwrap();
+    let (content_root, bind_address, log_level) = parse_args();
+    info!("Content root: {}", content_root);
+    set_log_level(log_level);
+    let cs = ContentStore::new(&content_root).unwrap();
     info!("Memory usage: {} bytes", cs.memory_usage());
-    cs.serve("127.0.0.1:8080").unwrap();
+    cs.serve(&bind_address).unwrap();
 }
