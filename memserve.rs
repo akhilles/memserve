@@ -105,22 +105,29 @@ impl Connection {
         Self {
             token,
             stream: None,
-            last_request: time::Instant::now(),
+            last_request: time::Instant::now() - time::Duration::from_secs(60),
             buffer: Box::new([0; MAX_REQUEST_SIZE]),
             buffer_len: 0,
             pending_write: None,
         }
     }
 
+    fn peer_addr(&self) -> Option<std::net::SocketAddr> {
+        self.stream
+            .as_ref()
+            .and_then(|stream| stream.peer_addr().ok())
+    }
+
     fn can_claim(&self) -> bool {
-        let stream = match &self.stream {
-            Some(stream) => stream,
-            None => return true,
+        let stale_duration = match &self.stream {
+            Some(_) => time::Duration::from_secs(60),
+            None => time::Duration::from_secs(10),
         };
-        let stale = self.last_request.elapsed() > time::Duration::from_secs(10);
+        let stale = self.last_request.elapsed() > stale_duration;
         if stale {
-            let addr = stream.peer_addr().unwrap();
-            info!("Connection from addr={} is stale", addr);
+            if let Some(addr) = self.peer_addr() {
+                info!("Connection from addr={} is stale", addr);
+            }
         }
         stale
     }
@@ -244,8 +251,10 @@ impl Connection {
         self.clear();
         if let Some(mut stream) = self.stream.take() {
             poll.registry().deregister(&mut stream).unwrap();
-            let addr = stream.peer_addr().unwrap();
-            info!("Closing connection from addr={}", addr);
+            if let Ok(addr) = stream.peer_addr() {
+                info!("Closing connection from addr={}", addr);
+            }
+            self.last_request = time::Instant::now();
         }
     }
 }
@@ -392,7 +401,7 @@ impl ContentStore {
         let mut listener = TcpListener::bind(addr)?;
         info!("Listening on {}", addr);
         let mut poll = Poll::new()?;
-        let mut events = Events::with_capacity(MAX_CONNECTIONS);
+        let mut events = Events::with_capacity(MAX_CONNECTIONS * 8);
         poll.registry()
             .register(&mut listener, SERVER_TOKEN, Interest::READABLE)?;
         let mut connections: [_; MAX_CONNECTIONS] = from_fn(|i| Connection::new(Token(i)));
@@ -402,23 +411,7 @@ impl ContentStore {
             for event in events.iter() {
                 match event.token() {
                     SERVER_TOKEN => {
-                        let (stream, addr) = match listener.accept() {
-                            Ok(conn) => conn,
-                            Err(err) => {
-                                error!("Error accepting connection: {:?}", err);
-                                continue;
-                            }
-                        };
-                        match connections.iter_mut().find(|conn| conn.can_claim()) {
-                            Some(conn) => {
-                                conn.accept(stream, &poll);
-                                info!("Accepted connection from: addr={}", addr);
-                            }
-                            None => {
-                                error!("Connection limit reached, dropping new connection");
-                                continue;
-                            }
-                        }
+                        accept_new_connections(&mut listener, &mut connections, &poll)?;
                     }
                     Token(id) => {
                         let conn = &mut connections[id];
@@ -514,6 +507,27 @@ impl ContentStore {
             .map(|(hash, response)| hash.as_bytes().len() + response.len())
             .sum()
     }
+}
+
+fn accept_new_connections(
+    listener: &mut TcpListener,
+    connections: &mut [Connection; MAX_CONNECTIONS],
+    poll: &Poll,
+) -> io::Result<()> {
+    loop {
+        match listener.accept() {
+            Ok((stream, addr)) => match connections.iter_mut().find(|conn| conn.can_claim()) {
+                Some(conn) => {
+                    conn.accept(stream, poll);
+                    info!("Accepted connection from: addr={}", addr);
+                }
+                None => error!("Connection limit reached, dropping new connection"),
+            },
+            Err(err) if err.kind() == io::ErrorKind::WouldBlock => break,
+            Err(err) => error!("Error accepting connection: {:?}", err),
+        }
+    }
+    Ok(())
 }
 
 fn http_response(content_type: &str, body: Vec<u8>, gzipped: bool) -> Response {
@@ -667,8 +681,8 @@ fn parse_args() -> (String, String, LogLevel) {
 
 fn main() {
     let (content_root, bind_address, log_level) = parse_args();
-    info!("Content root: {}", content_root);
     set_log_level(log_level);
+    info!("Content root: {}", content_root);
     let cs = ContentStore::new(&content_root).unwrap();
     info!("Memory usage: {} bytes", cs.memory_usage());
     cs.serve(&bind_address).unwrap();
