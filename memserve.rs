@@ -6,6 +6,8 @@ use flate2::write::GzEncoder;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 
+const MAX_FILE_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
+const MAX_DEPTH: usize = 8;
 const MAX_CONNECTIONS: usize = 1024;
 const MAX_PATH_LEN: usize = 256;
 const MAX_REQUEST_SIZE: usize = 4096;
@@ -294,11 +296,26 @@ impl ContentStore {
             };
             let entry = entry.unwrap();
             let path = entry.path();
-            if path.is_symlink() {
+            let meta = match entry.metadata() {
+                Ok(meta) => meta,
+                Err(e) => {
+                    eprintln!("Skipping {}: {}", path.display(), e);
+                    continue;
+                }
+            };
+            if meta.is_symlink() {
                 eprintln!("Skipping symlink {}", path.display());
-            } else if path.is_dir() {
+            } else if meta.is_dir() {
+                if stack.len() > MAX_DEPTH {
+                    eprintln!("Skipping {} because it's too deep", path.display());
+                    continue;
+                }
                 stack.push(std::fs::read_dir(path).unwrap());
-            } else if path.is_file() {
+            } else if meta.is_file() {
+                if meta.len() > MAX_FILE_SIZE as u64 {
+                    eprintln!("Skipping {} because it's too large", path.display());
+                    continue;
+                }
                 let path = path.strip_prefix(".").unwrap();
                 let path_str = path.to_str().unwrap().to_string();
                 eprintln!("Adding file {}", path_str);
