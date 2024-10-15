@@ -3,6 +3,7 @@ use std::io::Write as _;
 use std::io::{self, IoSlice, Read};
 use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::SystemTime;
 use std::{array::from_fn, collections::HashMap, fmt, path::Path};
 
 use flate2::write::GzEncoder;
@@ -25,6 +26,7 @@ struct ContentStore {
 struct Connection {
     token: Token,
     stream: Option<TcpStream>,
+    last_request: SystemTime,
     buffer: Box<[u8]>,
     buffer_len: usize,
     pending_write: Option<PendingWrite>,
@@ -105,10 +107,27 @@ impl Connection {
         Self {
             token,
             stream: None,
+            last_request: std::time::UNIX_EPOCH,
             buffer: Box::new([0; MAX_REQUEST_SIZE]),
             buffer_len: 0,
             pending_write: None,
         }
+    }
+
+    fn can_claim(&self) -> bool {
+        let stream = match &self.stream {
+            Some(stream) => stream,
+            None => return true,
+        };
+        let stale = self
+            .last_request
+            .elapsed()
+            .map_or(true, |elapsed| elapsed.as_secs() >= 60);
+        if stale {
+            let addr = stream.peer_addr().unwrap();
+            info!("Connection from addr={} is stale", addr);
+        }
+        stale
     }
 
     fn try_read(&mut self) -> io::Result<usize> {
@@ -202,6 +221,7 @@ impl Connection {
         let request = Request::new(path, accept_gzip, if_none_match)?;
         self.buffer.copy_within(len.., 0);
         self.buffer_len -= len;
+        self.last_request = SystemTime::now();
         Ok(request)
     }
 
@@ -210,24 +230,28 @@ impl Connection {
         self.buffer_len = 0;
     }
 
-    fn accept(&mut self, stream: TcpStream, poll: &Poll) -> io::Result<()> {
+    fn accept(&mut self, stream: TcpStream, poll: &Poll) {
+        if self.stream.is_some() {
+            self.close(poll);
+        }
         self.stream = Some(stream);
-        poll.registry().register(
-            self.stream.as_mut().unwrap(),
-            self.token,
-            Interest::READABLE.add(Interest::WRITABLE),
-        )?;
-        Ok(())
+        self.last_request = SystemTime::now();
+        poll.registry()
+            .register(
+                self.stream.as_mut().unwrap(),
+                self.token,
+                Interest::READABLE.add(Interest::WRITABLE),
+            )
+            .unwrap();
     }
 
-    fn close(&mut self, poll: &Poll) -> io::Result<()> {
+    fn close(&mut self, poll: &Poll) {
         self.clear();
         if let Some(mut stream) = self.stream.take() {
-            poll.registry().deregister(&mut stream)?;
-            let addr = stream.peer_addr()?;
-            info!("Closing connection from {}", addr);
+            poll.registry().deregister(&mut stream).unwrap();
+            let addr = stream.peer_addr().unwrap();
+            info!("Closing connection from addr={}", addr);
         }
-        Ok(())
     }
 }
 
@@ -390,9 +414,9 @@ impl ContentStore {
                                 continue;
                             }
                         };
-                        match connections.iter_mut().find(|c| c.stream.is_none()) {
+                        match connections.iter_mut().find(|conn| conn.can_claim()) {
                             Some(conn) => {
-                                conn.accept(stream, &poll)?;
+                                conn.accept(stream, &poll);
                                 info!("Accepted connection from: addr={}", addr);
                             }
                             None => {
@@ -404,16 +428,16 @@ impl ContentStore {
                     Token(id) => {
                         let conn = &mut connections[id];
                         if event.is_write_closed() || event.is_read_closed() {
-                            conn.close(&poll)?;
+                            conn.close(&poll);
                         } else if event.is_writable() {
                             if let Err(err) = conn.try_write() {
                                 warn!("Error writing to connection: {:?}", err);
-                                conn.close(&poll)?;
+                                conn.close(&poll);
                             }
                         } else if event.is_readable() && conn.pending_write.is_none() {
                             if let Err(err) = conn.try_read() {
                                 warn!("Error reading from connection: {:?}", err);
-                                conn.close(&poll)?;
+                                conn.close(&poll);
                                 continue;
                             }
                             let res = match conn.parse_request() {
