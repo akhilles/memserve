@@ -1,6 +1,9 @@
+use std::fmt::Write as _;
+use std::io::Write as _;
 use std::io::{self, IoSlice, Read};
 use std::net::ToSocketAddrs;
-use std::{array::from_fn, collections::HashMap, fmt, io::Write, path::Path};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::{array::from_fn, collections::HashMap, fmt, path::Path};
 
 use flate2::write::GzEncoder;
 use mio::net::{TcpListener, TcpStream};
@@ -28,8 +31,7 @@ struct Connection {
 }
 
 struct PendingWrite {
-    header: &'static [u8],
-    body: &'static [u8],
+    response: Response,
     written: usize,
 }
 
@@ -42,10 +44,48 @@ struct Request {
 
 #[derive(Clone, Copy)]
 struct Response {
-    header: &'static [u8],
+    status: u16,
+    header: &'static str,
     body: &'static [u8],
     etag: Option<u128>,
 }
+
+#[derive(PartialEq, PartialOrd)]
+enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
+}
+
+static GLOBAL_LOG_LEVEL: AtomicUsize = AtomicUsize::new(LogLevel::Debug as usize);
+
+#[allow(dead_code)]
+fn set_log_level(level: LogLevel) {
+    GLOBAL_LOG_LEVEL.store(level as usize, Ordering::Relaxed);
+}
+
+macro_rules! log {
+    ($level:expr, $($arg:tt)+) => {{
+        if $level as usize <= GLOBAL_LOG_LEVEL.load(Ordering::Relaxed) {
+            let level_str = match $level {
+                LogLevel::Error => "ERROR",
+                LogLevel::Warn => "WARN ",
+                LogLevel::Info => "INFO ",
+                LogLevel::Debug => "DEBUG",
+                LogLevel::Trace => "TRACE",
+            };
+            eprintln!("[{}] {}", level_str, format!($($arg)+));
+        }
+    }};
+}
+
+macro_rules! error { ($($arg:tt)+) => { log!(LogLevel::Error, $($arg)+) }; }
+macro_rules! warn  { ($($arg:tt)+) => { log!(LogLevel::Warn,  $($arg)+) }; }
+macro_rules! info  { ($($arg:tt)+) => { log!(LogLevel::Info,  $($arg)+) }; }
+macro_rules! debug { ($($arg:tt)+) => { log!(LogLevel::Debug, $($arg)+) }; }
+macro_rules! trace { ($($arg:tt)+) => { log!(LogLevel::Trace, $($arg)+) }; }
 
 #[derive(Clone, Copy, Debug)]
 enum ParseRequestError {
@@ -82,7 +122,7 @@ impl Connection {
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => 0,
             Err(e) => return Err(e),
         };
-        println!("Read {} bytes", read_bytes);
+        trace!("Read {} bytes", read_bytes);
         self.buffer_len += read_bytes;
         Ok(read_bytes)
     }
@@ -93,8 +133,7 @@ impl Connection {
             None => return Ok(()),
         };
         let PendingWrite {
-            header,
-            body,
+            response: Response { header, body, .. },
             written,
         } = match &mut self.pending_write {
             Some(pending_write) => pending_write,
@@ -104,7 +143,7 @@ impl Connection {
         let body_offset = written.saturating_sub(header.len());
 
         let iov = [
-            IoSlice::new(&header[header_offset..]),
+            IoSlice::new(&header.as_bytes()[header_offset..]),
             IoSlice::new(&body[body_offset..]),
         ];
         let bytes_written = match stream.write_vectored(&iov) {
@@ -112,7 +151,7 @@ impl Connection {
             Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => 0,
             Err(e) => return Err(e),
         };
-        println!("Wrote {} bytes", bytes_written);
+        trace!("Wrote {} bytes", bytes_written);
         *written += bytes_written;
         if *written >= header.len() + body.len() {
             self.pending_write = None;
@@ -122,8 +161,7 @@ impl Connection {
 
     fn send(&mut self, response: Response) -> io::Result<()> {
         self.pending_write = Some(PendingWrite {
-            header: response.header,
-            body: response.body,
+            response,
             written: 0,
         });
         self.try_write()
@@ -138,8 +176,8 @@ impl Connection {
             self.buffer_len = 0;
             return Err(ParseRequestError::RequestTooLarge);
         }
-        let end = end.ok_or(ParseRequestError::Incomplete)? + 4;
-        let mut lines = std::str::from_utf8(&self.buffer[..end])?.lines();
+        let len = end.ok_or(ParseRequestError::Incomplete)? + 4;
+        let mut lines = std::str::from_utf8(&self.buffer[..len])?.lines();
         let mut req_parts = lines
             .next()
             .ok_or(ParseRequestError::BadRequest)?
@@ -162,8 +200,8 @@ impl Connection {
             }
         }
         let request = Request::new(path, accept_gzip, if_none_match)?;
-        self.buffer.copy_within(end.., 0);
-        self.buffer_len -= end;
+        self.buffer.copy_within(len.., 0);
+        self.buffer_len -= len;
         Ok(request)
     }
 
@@ -185,9 +223,10 @@ impl Connection {
     fn close(&mut self, poll: &Poll) -> io::Result<()> {
         self.clear();
         if let Some(mut stream) = self.stream.take() {
-            poll.registry().deregister(&mut stream)?
+            poll.registry().deregister(&mut stream)?;
+            let addr = stream.peer_addr()?;
+            info!("Closing connection from {}", addr);
         }
-        println!("Closing connection");
         Ok(())
     }
 }
@@ -236,17 +275,20 @@ impl Request {
 
 impl Response {
     const NOT_FOUND: Self = Self {
-        header: b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
+        status: 404,
+        header: "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n",
         body: b"",
         etag: None,
     };
     const BAD_REQUEST: Self = Self {
-        header: b"HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
+        status: 400,
+        header: "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\n",
         body: b"",
         etag: None,
     };
     const NOT_MODIFIED: Self = Self {
-        header: b"HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n",
+        status: 304,
+        header: "HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n",
         body: b"",
         etag: None,
     };
@@ -265,7 +307,7 @@ impl Response {
 
 impl fmt::Display for Response {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(std::str::from_utf8(self.header).unwrap())?;
+        f.write_str(self.header)?;
         let body_str = std::string::String::from_utf8_lossy(self.body);
         f.write_str(&body_str)?;
         Ok(())
@@ -283,60 +325,53 @@ impl Default for ContentStore {
 }
 
 impl ContentStore {
-    fn new(root: &str) -> Self {
-        std::env::set_current_dir(root).unwrap();
+    fn new(root: &str) -> io::Result<Self> {
+        std::env::set_current_dir(root)?;
         let mut store = Self::default();
 
-        let mut stack = vec![std::fs::read_dir(".").unwrap()];
+        let mut stack = vec![std::fs::read_dir(".")?];
         while let Some(dir) = stack.last_mut() {
             // If we've read all entries in the current directory, pop it off the stack
             let Some(entry) = dir.next() else {
                 stack.pop();
                 continue;
             };
-            let entry = entry.unwrap();
+            let entry = entry?;
             let path = entry.path();
-            let meta = match entry.metadata() {
-                Ok(meta) => meta,
-                Err(e) => {
-                    eprintln!("Skipping {}: {}", path.display(), e);
-                    continue;
-                }
-            };
+            let meta = entry.metadata()?;
             if meta.is_symlink() {
-                eprintln!("Skipping symlink {}", path.display());
+                warn!("Skipping symlink {}", path.display());
             } else if meta.is_dir() {
                 if stack.len() > MAX_DEPTH {
-                    eprintln!("Skipping {} because it's too deep", path.display());
+                    warn!("Skipping {} because it's too deep", path.display());
                     continue;
                 }
                 stack.push(std::fs::read_dir(path).unwrap());
             } else if meta.is_file() {
                 if meta.len() > MAX_FILE_SIZE as u64 {
-                    eprintln!("Skipping {} because it's too large", path.display());
+                    warn!("Skipping {} because it's too large", path.display());
                     continue;
                 }
                 let path = path.strip_prefix(".").unwrap();
                 let path_str = path.to_str().unwrap().to_string();
-                eprintln!("Adding file {}", path_str);
+                debug!("Adding file {}", path_str);
                 store.put(String::leak(path_str));
             } else {
-                eprintln!("Skipping special file {}", path.display());
+                warn!("Skipping special file {}", path.display());
             }
         }
 
         // If we have a 404.html file, use it as the 404 response
-        if let Some(res) = store.get(Request::new("404.html", false, None).unwrap()) {
+        if let Some(res) = store.plain_responses.get("404.html") {
             store.not_found = custom_not_found(res.body);
         }
-
-        store
+        Ok(store)
     }
 
     fn serve<A: ToSocketAddrs>(&self, addr: A) -> io::Result<()> {
         let addr = addr.to_socket_addrs()?.next().unwrap();
         let mut listener = TcpListener::bind(addr)?;
-        println!("Listening on {}", addr);
+        info!("Listening on {}", addr);
         let mut poll = Poll::new()?;
         let mut events = Events::with_capacity(MAX_CONNECTIONS);
         poll.registry()
@@ -351,17 +386,17 @@ impl ContentStore {
                         let (stream, addr) = match listener.accept() {
                             Ok(conn) => conn,
                             Err(err) => {
-                                eprintln!("Error accepting connection: {:?}", err);
+                                error!("Error accepting connection: {:?}", err);
                                 continue;
                             }
                         };
                         match connections.iter_mut().find(|c| c.stream.is_none()) {
                             Some(conn) => {
                                 conn.accept(stream, &poll)?;
-                                println!("Accepted connection from: {}", addr);
+                                info!("Accepted connection from: addr={}", addr);
                             }
                             None => {
-                                eprintln!("Connection limit reached, dropping new connection");
+                                error!("Connection limit reached, dropping new connection");
                                 continue;
                             }
                         }
@@ -372,18 +407,18 @@ impl ContentStore {
                             conn.close(&poll)?;
                         } else if event.is_writable() {
                             if let Err(err) = conn.try_write() {
-                                eprintln!("Error writing to connection: {:?}", err);
+                                warn!("Error writing to connection: {:?}", err);
                                 conn.close(&poll)?;
                             }
                         } else if event.is_readable() && conn.pending_write.is_none() {
                             if let Err(err) = conn.try_read() {
-                                eprintln!("Error reading from connection: {:?}", err);
+                                warn!("Error reading from connection: {:?}", err);
                                 conn.close(&poll)?;
                                 continue;
                             }
                             let res = match conn.parse_request() {
                                 Ok(req) => {
-                                    println!("Received request: {:?}", req);
+                                    info!("< path=/{} gzip={}", req.path(), req.accept_gzip);
                                     self.get(req).unwrap_or(self.not_found)
                                 }
                                 Err(ParseRequestError::Incomplete) => continue,
@@ -392,6 +427,7 @@ impl ContentStore {
                                     Response::BAD_REQUEST
                                 }
                             };
+                            info!("> status={} len={}", res.status, res.len());
                             conn.send(res)?;
                         }
                     }
@@ -413,7 +449,7 @@ impl ContentStore {
         let body = match std::fs::read(path) {
             Ok(body) => body,
             Err(err) => {
-                eprintln!("Failed to read file {}: {}", path_str, err);
+                warn!("Failed to read file {}: {}", path_str, err);
                 return;
             }
         };
@@ -447,7 +483,6 @@ impl ContentStore {
             *self.plain_responses.get(path)?
         };
         if res.not_modified(&req) {
-            eprintln!("Strong ETag match");
             res = Response::NOT_MODIFIED;
         }
         Some(res)
@@ -466,7 +501,7 @@ fn http_response(content_type: &str, body: Vec<u8>, gzipped: bool) -> Response {
     let body = Box::leak(body.into_boxed_slice());
     let etag: u128 = xxhash_rust::xxh3::xxh3_128(body);
     let cache_control = cache_control(content_type);
-    let mut header = Vec::with_capacity(512);
+    let mut header = String::with_capacity(512);
     write!(&mut header, "HTTP/1.1 200 OK\r\n").unwrap();
     if gzipped {
         write!(&mut header, "Content-Encoding: gzip\r\n").unwrap();
@@ -476,8 +511,9 @@ fn http_response(content_type: &str, body: Vec<u8>, gzipped: bool) -> Response {
     write!(&mut header, "ETag: \"{:x}\"\r\n", etag).unwrap();
     write!(&mut header, "Cache-Control: {}\r\n", cache_control).unwrap();
     write!(&mut header, "Vary: Accept-Encoding\r\n\r\n").unwrap();
-    let header = Box::leak(header.into_boxed_slice());
+    let header = String::leak(header);
     Response {
+        status: 200,
         header,
         body,
         etag: Some(etag),
@@ -485,12 +521,13 @@ fn http_response(content_type: &str, body: Vec<u8>, gzipped: bool) -> Response {
 }
 
 fn custom_not_found(body: &'static [u8]) -> Response {
-    let mut header = Vec::with_capacity(512);
+    let mut header = String::with_capacity(512);
     write!(&mut header, "HTTP/1.1 404 Not Found\r\n").unwrap();
     write!(&mut header, "Content-Type: text/html\r\n").unwrap();
     write!(&mut header, "Content-Length: {}\r\n\r\n", body.len()).unwrap();
-    let header = Box::leak(header.into_boxed_slice());
+    let header = String::leak(header);
     Response {
+        status: 404,
         header,
         body,
         etag: None,
@@ -525,7 +562,7 @@ fn cache_control(content_type: &str) -> &'static str {
     match content_type {
         "application/javascript" => "max-age=3600, public", // 1 hour
         "font/woff2" => "max-age=86400, public",            // 1 day
-        _ => "max-age=0, public",                           // 1 minute
+        _ => "max-age=60, public",                          // 1 minute
     }
 }
 
@@ -543,7 +580,7 @@ fn gzippable(content_type: &str) -> bool {
 }
 
 fn main() {
-    let cs = ContentStore::new("../elo/paracosm/docs/public/public");
-    println!("Memory usage: {} bytes", cs.memory_usage());
+    let cs = ContentStore::new("../elo/paracosm/docs/public/public").unwrap();
+    info!("Memory usage: {} bytes", cs.memory_usage());
     cs.serve("127.0.0.1:8080").unwrap();
 }
