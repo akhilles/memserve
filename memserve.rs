@@ -523,7 +523,7 @@ fn accept_new_connections(
             Ok((stream, addr)) => match connections.iter_mut().find(|conn| conn.can_claim()) {
                 Some(conn) => {
                     conn.accept(stream, poll);
-                    info!("Accepted connection from: addr={}", addr);
+                    info!("Accepted connection from addr={}", addr);
                 }
                 None => error!("Connection limit reached, dropping new connection"),
             },
