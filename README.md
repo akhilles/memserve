@@ -19,4 +19,4 @@ Due to its very limited scope, memserve will make several simplifying assumption
 - Single-threaded.
 - Maximum file size is 32MiB.
 - Maximum number of connections is 1024.
-- "Date" header is not set in the response. It's technically required by the HTTP/1.1 spec, but I can argue section 14.8.3 applies to memserve.
+- "Date" header is not set in the response. HTTP/1.1 spec section 14.18.1 allows clockless servers to omit this header.
