@@ -9,6 +9,53 @@ use flate2::write::GzEncoder;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
 
+// rapidhash - based on https://github.com/Nicoshev/rapidhash
+#[rustfmt::skip]
+fn rapidhash(data: &[u8]) -> u64 {
+    const S: [u64; 8] = [
+        0x2d358dccaa6c78a5, 0x8bb84b93962eacc9, 0x4b33a62ed433d4a3, 0x4d5a2da51de1aa47,
+        0xa0761d6478bd642f, 0xe7037ed1a0b428db, 0x90ed1765281c388c, 0xaaaaaaaaaaaaaaaa,
+    ];
+    let mix = |a: u64, b: u64| { let r = (a as u128) * (b as u128); (r as u64) ^ ((r >> 64) as u64) };
+    let r64 = |p: &[u8]| u64::from_le_bytes(p[..8].try_into().unwrap());
+    let r32 = |p: &[u8]| u32::from_le_bytes(p[..4].try_into().unwrap()) as u64;
+
+    let len = data.len();
+    let mut seed = mix(S[2], S[1]);
+    let (a, b) = match len {
+        0 => (0, 0),
+        1..=3 => (((data[0] as u64) << 45) | data[len - 1] as u64, data[len >> 1] as u64),
+        4..=7 => { seed ^= len as u64; (r32(data), r32(&data[len - 4..])) }
+        8..=16 => { seed ^= len as u64; (r64(data), r64(&data[len - 8..])) }
+        _ => {
+            let (mut p, mut i) = (data, len);
+            if len > 112 {
+                let (mut s1, mut s2, mut s3, mut s4, mut s5, mut s6) = (seed, seed, seed, seed, seed, seed);
+                while i > 112 {
+                    seed = mix(r64(p)      ^ S[0], r64(&p[8..])   ^ seed);
+                    s1 = mix(r64(&p[16..]) ^ S[1], r64(&p[24..])  ^ s1);
+                    s2 = mix(r64(&p[32..]) ^ S[2], r64(&p[40..])  ^ s2);
+                    s3 = mix(r64(&p[48..]) ^ S[3], r64(&p[56..])  ^ s3);
+                    s4 = mix(r64(&p[64..]) ^ S[4], r64(&p[72..])  ^ s4);
+                    s5 = mix(r64(&p[80..]) ^ S[5], r64(&p[88..])  ^ s5);
+                    s6 = mix(r64(&p[96..]) ^ S[6], r64(&p[104..]) ^ s6);
+                    p = &p[112..]; i -= 112;
+                }
+                seed ^= s1 ^ s2 ^ s3 ^ s4 ^ s5 ^ s6;
+            }
+            if i > 16 { seed = mix(r64(p)        ^ S[2], r64(&p[8..])  ^ seed); }
+            if i > 32 { seed = mix(r64(&p[16..]) ^ S[2], r64(&p[24..]) ^ seed); }
+            if i > 48 { seed = mix(r64(&p[32..]) ^ S[1], r64(&p[40..]) ^ seed); }
+            if i > 64 { seed = mix(r64(&p[48..]) ^ S[1], r64(&p[56..]) ^ seed); }
+            if i > 80 { seed = mix(r64(&p[64..]) ^ S[2], r64(&p[72..]) ^ seed); }
+            if i > 96 { seed = mix(r64(&p[80..]) ^ S[1], r64(&p[88..]) ^ seed); }
+            (r64(&data[len - 16..]) ^ (len as u64), r64(&data[len - 8..]))
+        }
+    };
+    let r = ((a ^ S[1]) as u128) * ((b ^ seed) as u128);
+    mix((r as u64) ^ S[7], ((r >> 64) as u64) ^ S[1] ^ (len as u64))
+}
+
 const MAX_FILE_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
 const MAX_DEPTH: usize = 8;
 const MAX_CONNECTIONS: usize = 1024;
@@ -40,7 +87,7 @@ struct Request {
     path_buf: [u8; MAX_PATH_LEN],
     path_len: usize,
     accept_gzip: bool,
-    if_none_match: Option<u128>,
+    if_none_match: Option<u64>,
 }
 
 #[derive(Clone, Copy)]
@@ -48,7 +95,7 @@ struct Response {
     status: u16,
     header: &'static str,
     body: &'static [u8],
-    etag: Option<u128>,
+    etag: Option<u64>,
 }
 
 #[derive(PartialEq, PartialOrd)]
@@ -215,7 +262,7 @@ impl Connection {
                 accept_gzip = value.split(',').any(|enc| enc.eq_ignore_ascii_case("gzip"));
             } else if key.eq_ignore_ascii_case("if-none-match") {
                 let value = value.trim_matches(|c| c == '"');
-                if let Ok(etag) = u128::from_str_radix(value, 16) {
+                if let Ok(etag) = u64::from_str_radix(value, 16) {
                     if_none_match = Some(etag);
                 }
             }
@@ -276,7 +323,7 @@ impl Request {
     fn new(
         path_str: &str,
         accept_gzip: bool,
-        if_none_match: Option<u128>,
+        if_none_match: Option<u64>,
     ) -> Result<Self, ParseRequestError> {
         let path = path_str.as_bytes();
         if path.len() >= MAX_PATH_LEN {
@@ -508,7 +555,7 @@ impl ContentStore {
         self.plain_responses
             .iter()
             .chain(self.gzip_responses.iter())
-            .map(|(hash, response)| hash.as_bytes().len() + response.len())
+            .map(|(hash, response)| hash.len() + response.len())
             .sum()
     }
 }
@@ -536,7 +583,7 @@ fn accept_new_connections(
 
 fn http_response(content_type: &str, body: Vec<u8>, gzipped: bool) -> Response {
     let body = Box::leak(body.into_boxed_slice());
-    let etag: u128 = xxhash_rust::xxh3::xxh3_128(body);
+    let etag = rapidhash(body);
     let cache_control = cache_control(content_type);
     let mut header = String::with_capacity(512);
     write!(&mut header, "HTTP/1.1 200 OK\r\n").unwrap();

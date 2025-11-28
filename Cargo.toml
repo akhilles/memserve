@@ -13,5 +13,4 @@ path = "memserve.rs"
 
 [dependencies]
 mio = { version = "1.0.2", default-features = false, features = ["net", "os-poll"] }
-flate2 = { version = "1.0.34", default-features = false, features = ["rust_backend"] } # for gzip support
-xxhash-rust = { version = "0.8.12", default-features = false, features = ["xxh3"]} # for etags
+flate2 = { version = "1.0.34", default-features = false, features = ["rust_backend"] }
