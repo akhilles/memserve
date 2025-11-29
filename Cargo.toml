@@ -5,7 +5,7 @@ edition = "2021"
 description = "Web server that serves static web content from memory."
 repository = "https://git.sr.ht/~akhil/crc-catalog"
 readme = "README.md"
-license = "MIT OR Apache-2.0"
+license = "0BSD"
 
 [[bin]]
 name = "memserve"
