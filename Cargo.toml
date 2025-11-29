@@ -3,7 +3,7 @@ name = "memserve"
 version = "0.1.0"
 edition = "2021"
 description = "Web server that serves static web content from memory."
-repository = "https://git.sr.ht/~akhil/crc-catalog"
+repository = "https://git.sr.ht/~akhil/memserve"
 readme = "README.md"
 license = "0BSD"
 
