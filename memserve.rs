@@ -2,6 +2,7 @@ use std::fmt::Write as _;
 use std::io::Write as _;
 use std::io::{self, IoSlice, Read};
 use std::net::ToSocketAddrs;
+use std::str::from_utf8;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{array::from_fn, collections::HashMap, env, fmt, path::Path, process, time};
 
@@ -245,7 +246,7 @@ impl Connection {
             return Err(ParseRequestError::RequestTooLarge);
         }
         let len = end.ok_or(ParseRequestError::Incomplete)? + 4;
-        let mut lines = std::str::from_utf8(&self.buffer[..len])?.lines();
+        let mut lines = from_utf8(&self.buffer[..len])?.lines();
         let mut req_parts = lines
             .next()
             .ok_or(ParseRequestError::BadRequest)?
@@ -340,11 +341,9 @@ impl Request {
     }
 
     fn path(&self) -> &str {
-        let path = std::str::from_utf8(&self.path_buf[..self.path_len]).unwrap();
-        // remove leading and trailing slashes
-        let path = path.strip_prefix('/').unwrap_or(path);
-        let path = path.strip_suffix('/').unwrap_or(path);
-        path
+        from_utf8(&self.path_buf[..self.path_len])
+            .unwrap()
+            .trim_matches('/')
     }
 }
 
